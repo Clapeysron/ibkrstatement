@@ -13,6 +13,7 @@ Thumbs.db
 *.txt
 *.xls
 *.xlsx
+ibkr-report*.json
 !/robots.txt
 !/samples/ibkr-sample-9999.csv
 !/samples/ibkr-sample-demo.csv

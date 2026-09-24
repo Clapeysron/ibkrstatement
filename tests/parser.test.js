@@ -258,7 +258,7 @@ test('optional cash detail without an exchange rate keeps original currency and 
 
 test('NAV metadata distinguishes unavailable fields from actual zero and recognizes additional Chinese aliases', () => {
   const absent = parseIbkrReport(account);
-  assert.deepEqual(absent.navDetails, { hasNav: false, hasReturn: false, hasChange: false, changeKeys: [] });
+  assert.deepEqual(absent.navDetails, { hasNav: false, hasCash: false, hasReturn: false, hasChange: false, changeKeys: [] });
   assert.equal(absent.nav.total, 0); // Existing output remains compatible.
   const data = parseIbkrReport(account + [
     '净资产值,Header,资产类型,当前合计',
@@ -274,11 +274,30 @@ test('NAV metadata distinguishes unavailable fields from actual zero and recogni
     '净资产值变更,Data,结束价值,95.49'
   ].join('\n'));
   assert.deepEqual(data.navDetails, {
-    hasNav: true, hasReturn: true, hasChange: true,
+    hasNav: true, hasCash: false, hasReturn: true, hasChange: true,
     changeKeys: ['startingValue', 'changeInInterestAccruals', 'otherFXTranslations', 'endingValue']
   });
   near(data.navChange.find((row) => row.key === 'changeInInterestAccruals').value, 95.5);
   near(data.navChange.find((row) => row.key === 'otherFXTranslations').value, -0.01);
+});
+
+test('NAV cash presence distinguishes missing or invalid cash from zero and negative balances', () => {
+  for (const value of ['', '--', 'not a number']) {
+    const data = parseIbkrReport(account +
+      'Net Asset Value,Header,Asset Class,Current Total\nNet Asset Value,Data,Cash,' + value + '\n');
+    assert.equal(data.navDetails.hasCash, false);
+    assert.equal(data.nav.cash, 0);
+  }
+  for (const value of [0, 125.5, -250]) {
+    for (const column of ['Current Total', 'Total']) {
+      const data = parseIbkrReport(account +
+        `Net Asset Value,Header,Asset Class,${column}\nNet Asset Value,Data,Cash,${value}\n`);
+      assert.equal(data.navDetails.hasCash, true);
+      assert.equal(data.nav.cash, value);
+    }
+  }
+  assert.equal(parseIbkrReport(chineseReport).navDetails.hasCash, true);
+  assert.equal(parseIbkrReport(chineseReport).nav.cash, 900);
 });
 
 test('trade raw time is retained without changing the existing timestamp or counting subtotals', () => {

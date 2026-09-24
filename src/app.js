@@ -1,8 +1,10 @@
 import { parseIbkrReport } from './parser.js';
 import { decodeReportFile } from './encoding.js';
-import { reportRange, selectRange, filterTrades, instrumentFor, dailyRealized, rankRealized, cashRecords, assetBridge, holdingTotals } from './dashboard-model.js';
+import { createRealizedChart } from './interactive-chart.js';
+import { reportRange, selectRange, filterTrades, instrumentFor, dailyRealized, rankRealized, cashRecords, assetBridge, holdingTotals, holdingDistribution } from './dashboard-model.js';
 
 const app = document.querySelector('#app');
+let activeChart = null;
 const pages = [
   ['positions', '当前持仓', 'pie'], ['analysis', '资产盈亏分析', 'chart'],
   ['calendar', '收益日历', 'calendar'], ['summary', '盈亏总结', 'wallet'],
@@ -36,7 +38,7 @@ const colors = ['#ff5900', '#389cff', '#00b89c', '#ffb23f', '#a99af0', '#ed7fa9'
 const state = {
   data: null, page: 'analysis', sourceName: '', demo: false, error: '', loading: false,
   theme: localStorage.getItem('ibkr-analytics-theme') || 'dark', range: 'year',
-  chartMode: 'amount', calendarMode: 'month', calendarMetric: 'amount', calendarMonth: '', selectedDay: '',
+  chartMode: 'amount', chartDate: null, calendarMode: 'month', calendarMetric: 'amount', calendarMonth: '', selectedDay: '',
   rankingSide: 'profit', asset: 'all', search: '', holdSort: 'value', holdDesc: true, holdView: 'value',
   recordsPeriod: 'all', side: 'all', currency: 'all', recordType: 'all', dateFrom: '', dateTo: '',
   showFilters: false, limit: 40, modal: null
@@ -60,10 +62,26 @@ const segment = (key, values, selected) => `<div class="segmented">${values.map(
 const periodTabs = (key = 'range', selected = state.range) => `<div class="period-tabs" aria-label="统计期间">${periods.map(([v,l]) => `<button class="chip ${selected === v ? 'active' : ''}" data-set="${key}" data-value="${v}" aria-pressed="${selected === v}">${l}</button>`).join('')}</div>`;
 const panelHead = (heading, right = '', sub = '') => `<div class="panel-head"><div><h2 class="panel-title">${heading}</h2>${sub ? `<p class="panel-subtitle">${sub}</p>` : ''}</div>${right}</div>`;
 
+function securityTags(assetCategory, short = false) {
+  const label = category(assetCategory);
+  const tags = [label !== '股票' && label !== '证券' ? label : '', short ? '空头' : ''].filter(Boolean);
+  return tags.length ? `<span class="security-tags">${esc(tags.join(' · '))}</span>` : '';
+}
+function securityLabel(symbol, assetCategory, { name, clickable = false, short = false } = {}) {
+  const meta = instrumentFor(state.data, symbol, assetCategory);
+  const description = name || meta.name;
+  const primary = clickable
+    ? `<button class="security-code holding-name" data-symbol="${esc(symbol)}" data-category="${esc(assetCategory)}" title="${esc(symbol)}">${esc(symbol)}</button>`
+    : `<strong class="security-code" title="${esc(symbol)}">${esc(symbol)}</strong>`;
+  return `${primary}${description && description !== symbol ? `<span class="security-name" title="${esc(description)}">${esc(description)}</span>` : ''}${securityTags(assetCategory || meta.assetCategory,short)}`;
+}
+
 function render() {
+  activeChart = null;
   document.documentElement.dataset.theme = state.theme;
   document.documentElement.lang = 'zh-CN';
   app.innerHTML = state.data ? dashboard() : upload();
+  activeChart?.mount(app.querySelector('[data-realized-chart]'));
   document.body?.classList?.toggle('modal-open',Boolean(state.modal));
   if (!state.modal && state.focusReturn) {
     const {key,value}=state.focusReturn;
@@ -94,9 +112,9 @@ function dashboard() {
   const account = data.accountInfo.account || '本地账户';
   const mask = account.length > 5 ? account.slice(0,1) + '••••' + account.slice(-4) : account;
   return `<div class="app-shell"><aside class="sidebar">${brand()}<nav class="sidebar-nav" aria-label="报表导航">${pages.map(([id,label,ic]) => `<button class="nav-item ${state.page === id ? 'active' : ''}" data-page="${id}" ${state.page === id ? 'aria-current="page"' : ''}>${icon(ic)}<span>${label}</span></button>`).join('')}</nav><div class="sidebar-footer"><span>${icon('lock')} 本地解析 · 数据不上传</span><button class="button subtle" data-action="import">${icon('upload')} 导入新报表</button></div></aside>
-    <div class="workspace"><header class="topbar"><div class="topbar-title">${['calendar','summary','ranking','assets'].includes(state.page) ? `<button class="icon-button mobile-back" data-page="analysis" aria-label="返回分析">${icon('back')}</button>` : ''}<h1>${title()}</h1><span class="muted">截至 ${dateText(rr.end)}</span></div><div class="topbar-actions">${themeButton()}<button class="icon-button" data-action="export" aria-label="导出解析数据">${icon('download')}</button><button class="button subtle" data-action="import" aria-label="导入报表">${icon('upload')}<span>导入报表</span></button></div></header>
+    <div class="workspace" data-page="${state.page}"><header class="topbar"><div class="topbar-title">${['calendar','summary','ranking','assets'].includes(state.page) ? `<button class="icon-button mobile-back" data-page="analysis" aria-label="返回分析">${icon('back')}</button>` : ''}<h1>${title()}</h1><span class="muted">截至 ${dateText(rr.end)}</span></div><div class="topbar-actions">${themeButton()}<button class="icon-button" data-action="export" aria-label="导出解析数据">${icon('download')}</button><button class="button subtle" data-action="import" aria-label="导入报表">${icon('upload')}<span>导入报表</span></button></div></header>
     <div class="account-strip"><span class="account-avatar">${icon('wallet')}</span><div class="account-meta"><strong>证券账户 <span class="muted">(${esc(mask)})</span></strong><span>${esc(currency())} 本位币 <span class="account-period">· ${dateText(rr.start)} – ${dateText(rr.end)}</span></span></div>${state.demo ? '<span class="source-badge demo">示例数据</span>' : '<span class="source-badge">CSV 报表</span>'}${info('data')}</div>
-    <main class="content" id="mainContent">${renderPage()}</main>
+    <main class="content" id="mainContent" data-page="${state.page}">${renderPage()}</main>
     <footer class="data-footer">数据截至报表结束日 · ${esc(state.sourceName)} ${data.accountInfo.reportGeneratedAt ? `· 报表生成：${esc(data.accountInfo.reportGeneratedAt)}` : ''}</footer></div>
     <nav class="mobile-nav" aria-label="移动导航">${[['positions','持仓','pie'],['analysis','分析','chart'],['cash','资金','wallet'],['orders','成交','list']].map(([id,label,ic]) => `<button class="${(state.page === id || id === 'analysis' && ['calendar','summary','ranking','assets'].includes(state.page)) ? 'active' : ''}" data-page="${id}">${icon(ic)}<span>${label}</span></button>`).join('')}</nav>
     ${state.modal ? modal() : ''}</div>`;
@@ -113,7 +131,7 @@ function renderPage() {
 }
 function metric(label, value, sub = '', cls = '') { return `<div class="metric"><span class="muted">${label}</span><strong class="amount ${cls}">${value}</strong>${sub ? `<span class="subvalue">${sub}</span>` : ''}</div>`; }
 function positionsPage() {
-  const d = state.data, totals = holdingTotals(d);
+  const d = state.data, totals = holdingTotals(d), allocation = holdingDistribution(d);
   const query = state.search.trim().toLowerCase();
   let rows = d.positions.filter(p => !query || `${p.symbol} ${instrumentFor(d,p.symbol,p.assetCategory).name}`.toLowerCase().includes(query));
   rows = [...rows].sort((a,b) => { const key = ({value:'baseValue',profit:'baseUnrealizedPL',symbol:'symbol'})[state.holdSort] || 'baseValue'; const delta = typeof a[key] === 'string' ? a[key].localeCompare(b[key]) : a[key] - b[key]; return delta * (state.holdDesc ? -1 : 1); });
@@ -121,21 +139,21 @@ function positionsPage() {
   const net = d.navDetails?.hasNav ? d.nav.total : null;
   return `<section class="panel positions-panel">${panelHead('持仓分布', `<span class="muted">${d.positions.length} 只持仓</span>`)}
     <div class="holdings-summary">${metric(`持仓市值 (${esc(currency())})`,number(totals.value))}${metric('持仓盈亏',signed(totals.unrealized),'未实现盈亏',tone(totals.unrealized))}${metric('期末总资产',number(net),'含现金及应计项目')}</div>
-    ${distribution(d.positions,totals.grossValue)}
+    ${distribution(allocation)}
     <div class="toolbar"><label class="search-field">${icon('search')}<input data-input="search" value="${esc(state.search)}" placeholder="搜索证券名称或代码" aria-label="搜索持仓"></label><span class="muted">价格：报表收盘价</span></div>
-    ${rows.length ? groups.map(ccy => `<div class="holding-group"><h3>${esc(ccy)} 资产 <span class="muted">${number(rows.filter(p => p.currency === ccy).reduce((s,p) => s+p.value,0))}</span></h3><div class="hold-mobile-switch">${segment('holdView',[['value','市值 / 价格'],['profit','盈亏 / 占比']],state.holdView)}</div><div class="table-wrap"><table class="holdings-table" data-hold-view="${state.holdView}"><thead><tr><th><button data-sort="symbol">名称 / 代码 ↕</button></th><th class="valuation-col"><button data-sort="value">市值 / 数量 ↕</button></th><th class="valuation-col">收盘价 / 成本价</th><th class="profit-col"><button data-sort="profit">持仓盈亏 ↕</button></th><th class="profit-col">资产占比</th></tr></thead><tbody>${rows.filter(p => p.currency === ccy).map(p => {
+    ${rows.length ? groups.map(ccy => `<div class="holding-group"><h3>${esc(ccy)} 资产 <span class="muted">${number(rows.filter(p => p.currency === ccy).reduce((s,p) => s+p.value,0))}</span></h3><div class="hold-mobile-switch">${segment('holdView',[['value','市值 / 价格'],['profit','盈亏 / 占比']],state.holdView)}</div><div class="table-wrap"><table class="holdings-table" data-hold-view="${state.holdView}"><thead><tr><th><button data-sort="symbol">代码 / 名称 ↕</button></th><th class="valuation-col"><button data-sort="value">市值 / 数量 ↕</button></th><th class="valuation-col">收盘价 / 成本价</th><th class="profit-col"><button data-sort="profit">持仓盈亏 ↕</button></th><th class="profit-col">资产占比</th></tr></thead><tbody>${rows.filter(p => p.currency === ccy).map(p => {
       const meta = instrumentFor(d,p.symbol,p.assetCategory);
       const cost = Number.isFinite(p.costPrice) ? p.costPrice : p.quantity && p.multiplier ? p.costBasis/(p.quantity*p.multiplier) : null;
       const pct = p.costBasis ? p.unrealizedPL/Math.abs(p.costBasis)*100 : null;
-      return `<tr><td><button class="holding-name" data-symbol="${esc(p.symbol)}" data-category="${esc(p.assetCategory)}">${esc(meta.name || p.symbol)}</button><span class="symbol-line">${esc(p.symbol)} <small>${esc(category(p.assetCategory))}${p.quantity < 0 ? ' · 空头' : ''}</small></span></td><td class="valuation-col">${number(p.value)}<span class="subvalue">${number(p.quantity,Number.isInteger(p.quantity)?0:4)}</span></td><td class="valuation-col">${number(p.closePrice,3)}<span class="subvalue">${number(cost,3)}</span></td><td class="profit-col ${tone(p.unrealizedPL)}">${signed(p.unrealizedPL)}<span class="subvalue inherit">${Number.isFinite(pct) ? signed(pct)+'%' : '—'}</span></td><td class="profit-col">${net ? number(p.baseValue/net*100)+'%' : '—'}</td></tr>`;
+      return `<tr><td>${securityLabel(p.symbol,p.assetCategory,{name:meta.name,clickable:true,short:p.quantity<0})}</td><td class="valuation-col">${number(p.value)}<span class="subvalue">${number(p.quantity,Number.isInteger(p.quantity)?0:4)}</span></td><td class="valuation-col">${number(p.closePrice,3)}<span class="subvalue">${number(cost,3)}</span></td><td class="profit-col ${tone(p.unrealizedPL)}">${signed(p.unrealizedPL)}<span class="subvalue inherit">${Number.isFinite(pct) ? signed(pct)+'%' : '—'}</span></td><td class="profit-col">${net ? number(p.baseValue/net*100)+'%' : '—'}</td></tr>`;
     }).join('')}</tbody></table></div></div>`).join('') : empty('没有匹配的持仓','试试其他证券代码或名称。')}
-    <p class="footnote">市值、价格及盈亏按各行原币种展示；资产占比以本位币市值 ÷ 期末总资产计算。持仓分布按绝对市值计算。</p></section>`;
+    <p class="footnote">市值、价格及盈亏按各行原币种展示；资产占比以本位币市值 ÷ 期末总资产计算。分布图按证券${allocation.cash!==null?'与现金':''}的本位币绝对金额计算，不含应计利息等项目。${allocation.hasShort?'负持仓及现金借款按绝对金额计入分布。':''}${allocation.cash===null?'报表未提供现金余额，未计入分布。':''}</p></section>`;
 }
-function distribution(positions,total) {
-  if (!positions.length || !total) return '';
-  const items = positions.slice(0,5).map((p,i) => ({name:p.symbol,value:Math.abs(p.baseValue),color:colors[i]}));
-  if (positions.length > 5) items.push({name:'其他',value:positions.slice(5).reduce((s,p) => s+Math.abs(p.baseValue),0),color:colors[5]});
-  return `<div class="distribution-bar" aria-label="持仓市值分布">${items.map(p => `<span style="width:${p.value/total*100}%;background:${p.color}" title="${esc(p.name)} ${number(p.value/total*100)}%"></span>`).join('')}</div><div class="distribution-legend">${items.map(p => `<span><i class="legend-dot" style="background:${p.color}"></i>${esc(p.name)} <b>${number(p.value/total*100,1)}%</b></span>`).join('')}</div>`;
+function distribution(allocation) {
+  if (!allocation.items.length) return '';
+  const items = allocation.items.map((p,i) => ({...p,label:p.kind==='cash'?(p.value<0?'现金借款':'现金'):p.kind==='other'?'其他证券':p.symbol,color:p.kind==='cash'?'#8c9eae':colors[i%colors.length]}));
+  const tooltip = p => `${p.label} ${number(p.weight*100)}% · ${number(p.value)} ${currency()}`;
+  return `${allocation.total ? `<div class="distribution-bar" aria-label="证券与现金分布">${items.filter(p=>p.weight>0).map(p => `<span style="width:${p.weight*100}%;background:${p.color}" title="${esc(tooltip(p))}"></span>`).join('')}</div>` : ''}<div class="distribution-legend">${items.map(p => `<span class="distribution-item" title="${esc(tooltip(p))}"><i class="legend-dot" style="background:${p.color}"></i><span class="distribution-security">${p.kind==='security'?securityLabel(p.symbol,p.assetCategory,{name:p.name,short:p.value<0}):`<strong class="security-code">${p.label}</strong>`}</span><b>${number(p.weight*100,1)}%</b></span>`).join('')}</div>`;
 }
 function capitalBase() {
   const b=assetBridge(state.data);
@@ -162,25 +180,14 @@ function analysisPage() {
 }
 function lineChart(days,r,base=null) {
   if (!days.length) return empty('当前期间没有已实现交易记录');
-  const points=[];let sum=0;
-  points.push({date:r.start,value:0});
-  for(const day of days) {
-    const previous=points.at(-1);
-    if(Date.parse(day.date)-Date.parse(previous.date)>86400000)points.push({date:new Date(Date.parse(day.date)-86400000).toISOString().slice(0,10),value:sum});
-    sum+=base?day.value/base*100:day.value;points.push({date:day.date,value:sum});
-  }
-  if(points.at(-1).date!==r.end)points.push({date:r.end,value:sum});
-  const mobile=window.matchMedia?.('(max-width: 600px)')?.matches;
-  const width=mobile?420:920,height=mobile?245:280,left=8,right=mobile?70:98,top=18,bottom=30;
-  const start=Date.parse(r.start),span=Math.max(86400000,Date.parse(r.end)-start);
-  let min=Math.min(0,...points.map(p=>p.value)),max=Math.max(0,...points.map(p=>p.value));
-  const pad=(max-min||1)*0.15;min-=pad;max+=pad;
-  const x=p=>left+(Date.parse(p.date)-start)/span*(width-left-right);
-  const y=v=>top+(max-v)/(max-min)*(height-top-bottom);
-  const line=points.map((p,i)=>`${i?'L':'M'}${x(p).toFixed(2)},${y(p.value).toFixed(2)}`).join(' ');
-  const area=`${line} L${x(points.at(-1)).toFixed(2)},${height-bottom} L${x(points[0]).toFixed(2)},${height-bottom}Z`;
-  const ticks=Array.from({length:5},(_,i)=>max-(max-min)*i/4);
-  return `<div class="chart-wrap"><svg class="line-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="累计已实现盈亏走势，期末 ${signed(sum)} ${base?'%':esc(currency())}"><defs><linearGradient id="profitFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#ff5900" stop-opacity=".23"/><stop offset="100%" stop-color="#ff5900" stop-opacity="0"/></linearGradient></defs>${ticks.map(v=>`<line class="chart-grid" x1="${left}" y1="${y(v)}" x2="${width-right}" y2="${y(v)}"/><text class="chart-label" x="${width-right+14}" y="${y(v)+4}">${number(v,base?2:0)}${base?'%':''}</text>`).join('')}<path class="chart-area" d="${area}" fill="url(#profitFill)" stroke="none"/><path class="chart-line" d="${line}"/>${points.slice(1).map(p=>`<circle cx="${x(p)}" cy="${y(p.value)}" r="5" fill="transparent" stroke="none"><title>${p.date}：${signed(p.value)} ${base?'%':esc(currency())}</title></circle>`).join('')}<text class="chart-label" x="${left}" y="${height-3}">${dateText(r.start)}</text><text class="chart-label" x="${width-right}" y="${height-3}" text-anchor="end">${dateText(r.end)}</text></svg></div>`;
+  const coverage = reportRange(state.data);
+  const chartRange = { start: coverage.start > r.start ? coverage.start : r.start, end: r.end };
+  activeChart = createRealizedChart({
+    days, range: chartRange, base, currency: currency(), selectedDate: state.chartDate,
+    mobile: window.matchMedia?.('(max-width: 600px)')?.matches,
+    onSelect: date => { state.chartDate = date; }
+  });
+  return activeChart?.html || empty('当前期间没有已实现交易记录');
 }
 function calendarCard(preview) {
   const rr=reportRange(state.data),month=state.calendarMonth || rr.end?.slice(0,7);
@@ -191,10 +198,10 @@ function calendarCard(preview) {
   const titleText=`收益日历 (${esc(currency())})`;
   let grid='';
   if(state.calendarMode==='year') {
-    grid=`<div class="year-grid">${Array.from({length:12},(_,i)=>{const m=`${year}-${String(i+1).padStart(2,'0')}`,rows=dayRows.filter(d=>d.date.startsWith(m)),value=rows.reduce((s,d)=>s+d.value,0);return `<button class="year-cell ${rows.length?tone(value):''}" data-month="${m}" ${m<rrStart||m>rrEnd?'disabled':''}><span>${i+1} 月</span><strong>${rows.length?(state.calendarMetric==='amount'?compact(value):displayProfit(value,'rate')):'—'}</strong><small>${rows.length ? rows.reduce((s,d)=>s+d.count,0)+' 笔成交' : '无成交记录'}</small></button>`;}).join('')}</div>`;
+    grid=`<div class="year-grid">${Array.from({length:12},(_,i)=>{const m=`${year}-${String(i+1).padStart(2,'0')}`,rows=dayRows.filter(d=>d.date.startsWith(m)),value=rows.reduce((s,d)=>s+d.value,0);return `<button class="year-cell ${rows.length?tone(value):''}" data-month="${m}" ${m<rrStart||m>rrEnd?'disabled':''}><span>${i+1} 月</span><strong>${rows.length?(state.calendarMetric==='amount'?compact(value):displayProfit(value,'rate')):'—'}</strong></button>`;}).join('')}</div>`;
   } else {
     const offset=new Date(year,mo-1,1).getDay(),count=new Date(year,mo,0).getDate();
-    grid=`<div class="calendar-grid">${['日','一','二','三','四','五','六'].map(w=>`<div class="calendar-weekday">${w}</div>`).join('')}${Array.from({length:offset},()=>'<div class="calendar-day empty"></div>').join('')}${Array.from({length:count},(_,i)=>{const date=`${month}-${String(i+1).padStart(2,'0')}`,row=byDay.get(date),value=row?.value;return `<button class="calendar-day ${row?(value>0?'profit':value<0?'loss':''):''} ${state.selectedDay===date?'selected':''}" data-day="${date}" ${!row?'disabled':''} aria-label="${date}${row?` 已实现盈亏 ${signed(value)}，${row.count} 笔成交`:' 无成交记录'}"><span class="day-number">${String(i+1).padStart(2,'0')}</span><span class="day-value">${row?(state.calendarMetric==='amount'?compact(value):displayProfit(value,'rate')):''}</span></button>`;}).join('')}</div>`;
+    grid=`<div class="calendar-grid">${['日','一','二','三','四','五','六'].map(w=>`<div class="calendar-weekday">${w}</div>`).join('')}${Array.from({length:offset},()=>'<div class="calendar-day empty"></div>').join('')}${Array.from({length:count},(_,i)=>{const date=`${month}-${String(i+1).padStart(2,'0')}`,row=byDay.get(date),value=row?.value;return `<button class="calendar-day ${row?(value>0?'profit':value<0?'loss':''):''} ${state.selectedDay===date?'selected':''}" data-day="${date}" ${!row?'disabled':''} aria-label="${date}${row?` 已实现盈亏 ${displayProfit(value,state.calendarMetric)}`:' 无成交记录'}"><span class="day-number">${String(i+1).padStart(2,'0')}</span><span class="day-value">${row?(state.calendarMetric==='amount'?compact(value):displayProfit(value,'rate')):''}</span></button>`;}).join('')}</div>`;
   }
   return `<section class="panel calendar-panel">${panelHead(titleText,preview?go('calendar','查看全部'):info('calendar'),'股票及期权 · 已实现交易盈亏')}<div class="calendar-toolbar"><div class="month-picker"><button class="icon-button small" data-action="prev-month" aria-label="上${state.calendarMode==='year'?'年':'月'}" ${month<=rrStart?'disabled':''}>${icon('back')}</button><strong>${state.calendarMode==='year'?year:month.replace('-','/')}</strong><button class="icon-button small" data-action="next-month" aria-label="下${state.calendarMode==='year'?'年':'月'}" ${month>=rrEnd?'disabled':''}>${icon('chevron')}</button></div><div class="calendar-switches">${segment('calendarMode',[['year','年'],['month','月']],state.calendarMode)}${segment('calendarMetric',[['amount','金额'],['rate','百分比']],state.calendarMetric)}</div></div>${grid}
   ${state.calendarMetric==='rate'?'<p class="footnote">百分比为该日或该月已实现盈亏 ÷ 报表固定投入基数（期初资产 + 已识别净投入），非每日账户收益率。</p>':'<p class="footnote">空白日期表示没有成交记录；不代表账户当日盈亏为零。</p>'}
@@ -205,7 +212,7 @@ function rankRows(preview=false) {
   rows=state.rankingSide==='profit'?rows.filter(x=>x.value>0):rows.filter(x=>x.value<0).sort((a,b)=>a.value-b.value);
   if(preview)rows=rows.slice(0,5);
   const max=Math.max(...rows.map(x=>Math.abs(x.value)),1);
-  return rows.length?`<div class="rank-list">${rows.map((p,i)=>`<button class="rank-row" data-symbol="${esc(p.symbol)}" data-category="${esc(p.assetCategory)}"><span class="rank-fill ${tone(p.value)}" style="width:${Math.abs(p.value)/max*100}%"></span><span class="rank-number">${i+1}</span><span class="rank-symbol"><strong>${esc(p.name||p.symbol)}</strong><span class="symbol-line">${esc(p.symbol)} · ${esc(category(p.assetCategory))}</span></span><span class="rank-amount ${tone(p.value)}">${signed(p.value)}</span></button>`).join('')}</div>`:empty(state.rankingSide==='profit'?'当前期间没有盈利标的':'当前期间没有亏损标的');
+  return rows.length?`<div class="rank-list">${rows.map((p,i)=>`<button class="rank-row" data-symbol="${esc(p.symbol)}" data-category="${esc(p.assetCategory)}"><span class="rank-fill ${tone(p.value)}" style="width:${Math.abs(p.value)/max*100}%"></span><span class="rank-number">${i+1}</span><span class="rank-symbol">${securityLabel(p.symbol,p.assetCategory,{name:p.name})}</span><span class="rank-amount ${tone(p.value)}">${signed(p.value)}</span></button>`).join('')}</div>`:empty(state.rankingSide==='profit'?'当前期间没有盈利标的':'当前期间没有亏损标的');
 }
 function rankingCard(preview) {
   return `<section class="panel ranking-panel">${panelHead(`${state.range==='year'?'本年':'区间'}盈亏排行榜 (${esc(currency())})`,preview?go('ranking','盈亏详情'):info('performance'),'已实现交易盈亏')}${segment('rankingSide',[['profit',preview?'盈利 Top5':'盈利'],['loss',preview?'亏损 Top5':'亏损']],state.rankingSide)}<div class="list-heading"><span>排行榜</span><span>盈亏总额</span></div>${rankRows(preview)}</section>`;
@@ -215,11 +222,11 @@ function assetTabs() { return `<div class="toolbar">${segment('asset',[['all','�
 function summaryCard() {
   const ranks=rankRealized(state.data,range());
   const sum=hasTrades()?ranks.reduce((s,p)=>s+p.value,0):null,best=ranks.find(p=>p.value>0),worst=[...ranks].reverse().find(p=>p.value<0);
-  return `<section class="panel summary-panel">${panelHead(`${state.range==='year'?'本年':'区间'}盈亏总结 (${esc(currency())})`,go('summary','盈亏明细'))}<div class="summary-total"><span>股票及期权累计已实现盈亏</span><strong class="${tone(sum)}">${signed(sum)}</strong></div><div class="summary-duel"><div class="duel-gain"><span>盈利最多 ↗</span><strong>${esc(best?.name||best?.symbol||'暂无')}</strong><b>${best?signed(best.value):'—'}</b></div><div class="duel-loss"><span>亏损最多 ↘</span><strong>${esc(worst?.name||worst?.symbol||'暂无')}</strong><b>${worst?signed(worst.value):'—'}</b></div></div></section>`;
+  return `<section class="panel summary-panel">${panelHead(`${state.range==='year'?'本年':'区间'}盈亏总结 (${esc(currency())})`,go('summary','盈亏明细'))}<div class="summary-total"><span>股票及期权累计已实现盈亏</span><strong class="${tone(sum)}">${signed(sum)}</strong></div><div class="summary-duel"><div class="duel-gain"><span>盈利最多 ↗</span><div class="security-identity">${best?securityLabel(best.symbol,best.assetCategory,{name:best.name}):'<strong>暂无</strong>'}</div><b>${best?signed(best.value):'—'}</b></div><div class="duel-loss"><span>亏损最多 ↘</span><div class="security-identity">${worst?securityLabel(worst.symbol,worst.assetCategory,{name:worst.name}):'<strong>暂无</strong>'}</div><b>${worst?signed(worst.value):'—'}</b></div></div></section>`;
 }
 function summaryPage() {
   const rows=rankRealized(state.data,range(),state.asset),sum=hasTrades()?rows.reduce((s,p)=>s+p.value,0):null;
-  return `${periodTabs()}${assetTabs()}<section class="panel summary-hero"><p class="muted">${dateText(range().start)} – ${dateText(range().end)}</p><h2>累计已实现盈亏 (${esc(currency())}) ${info('performance')}</h2><div class="big-amount ${tone(sum)}">${signed(sum)}</div></section><section class="panel">${panelHead('盈亏明细','<span class="muted">按已实现盈亏排序</span>')}<div class="list-heading"><span>名称 / 代码</span><span>盈亏金额</span></div>${rows.length?`<div class="record-list">${rows.map(p=>`<button class="record-row" data-symbol="${esc(p.symbol)}" data-category="${esc(p.assetCategory)}"><span class="record-main"><strong>${esc(p.name||p.symbol)}</strong><span>${esc(p.symbol)} · ${category(p.assetCategory)}</span></span><span class="record-right ${tone(p.value)}"><strong>${signed(p.value)}</strong><span class="muted">${p.count} 笔成交</span></span></button>`).join('')}</div>`:empty('当前期间没有已实现盈亏记录')}</section>`;
+  return `${periodTabs()}${assetTabs()}<section class="panel summary-hero"><p class="muted">${dateText(range().start)} – ${dateText(range().end)}</p><h2>累计已实现盈亏 (${esc(currency())}) ${info('performance')}</h2><div class="big-amount ${tone(sum)}">${signed(sum)}</div></section><section class="panel">${panelHead('盈亏明细','<span class="muted">按已实现盈亏排序</span>')}<div class="list-heading"><span>代码 / 名称</span><span>盈亏金额</span></div>${rows.length?`<div class="record-list">${rows.map(p=>`<button class="record-row" data-symbol="${esc(p.symbol)}" data-category="${esc(p.assetCategory)}"><span class="record-main">${securityLabel(p.symbol,p.assetCategory,{name:p.name})}</span><span class="record-right ${tone(p.value)}"><strong>${signed(p.value)}</strong><span class="muted">${p.count} 笔成交</span></span></button>`).join('')}</div>`:empty('当前期间没有已实现盈亏记录')}</section>`;
 }
 function assetsCard(preview) {
   const b=assetBridge(state.data),rr=reportRange(state.data);
@@ -242,12 +249,17 @@ function cashPage() {
   const r=recordRange(),q=state.search.trim().toLowerCase();
   const rows=cashRecords(state.data).filter(t=>(!r.start||t.date>=r.start)&&(!r.end||t.date<=r.end)&&(state.currency==='all'||state.currency===t.currency)&&(state.recordType==='all'||state.recordType===t.type)&&(!q||`${t.symbol} ${t.description} ${instrumentFor(state.data,t.symbol).name}`.toLowerCase().includes(q)));
   let lastMonth='';
-  return `<section class="panel records-panel">${panelHead('资金记录',info('cash'))}${recordFilters(true)}<p class="footnote">成交款项、关联手续费及报表现金流水按原币种展示。手续费日期为关联成交日期。</p>${rows.length?`<div class="record-list">${rows.slice(0,state.limit).map(t=>{let heading='';const m=t.date.slice(0,7);if(m!==lastMonth){lastMonth=m;heading=`<h3 class="record-month">${m.replace('-',' 年 ')} 月</h3>`;}return `${heading}<button class="record-row" ${Number.isInteger(t.tradeIndex)?`data-trade="${t.tradeIndex}"`:`data-cash="${esc(t.id)}"`}><span class="record-main"><strong>${esc(t.title)}</strong><span>${esc(t.dateTimeText||dateText(t.date))}</span></span><span class="record-right"><strong>${t.amount<0?'-':t.amount>0?'+':''}${esc(t.currency)} ${number(Math.abs(t.amount))}</strong><span>${esc(t.symbol||t.description||'')}${Number.isFinite(t.quantity)?' | '+number(t.quantity,Number.isInteger(t.quantity)?0:4):''}</span></span></button>`;}).join('')}</div>${more(rows.length)}`:empty('没有匹配的资金记录','调整日期、币种或记录类型后再试。')}</section>`;
+  return `<section class="panel records-panel">${panelHead('资金记录',info('cash'))}${recordFilters(true)}<p class="footnote">成交款项、关联手续费及报表现金流水按原币种展示。手续费日期为关联成交日期。</p>${rows.length?`<div class="record-list">${rows.slice(0,state.limit).map(t=>{let heading='';const m=t.date.slice(0,7);if(m!==lastMonth){lastMonth=m;heading=`<h3 class="record-month">${m.replace('-',' 年 ')} 月</h3>`;}return `${heading}${cashRow(t)}`;}).join('')}</div>${more(rows.length)}`:empty('没有匹配的资金记录','调整日期、币种或记录类型后再试。')}</section>`;
+}
+function cashRow(t) {
+  const trade = Number.isInteger(t.tradeIndex) ? state.data.tradeDetails[t.tradeIndex] : null;
+  const quantity = Number.isFinite(t.quantity) ? ` · ${number(Math.abs(t.quantity),Number.isInteger(t.quantity)?0:4)}` : '';
+  return `<button class="record-row ${t.symbol?'cash-security-row':''}" ${trade?`data-trade="${t.tradeIndex}"`:`data-cash="${esc(t.id)}"`}><span class="record-main">${t.symbol?securityLabel(t.symbol,trade?.assetCategory):`<strong>${esc(t.title)}</strong>`}<span class="record-meta">${esc(t.dateTimeText||dateText(t.date))}</span></span><span class="record-right"><strong>${t.amount<0?'-':t.amount>0?'+':''}${esc(t.currency)} ${number(Math.abs(t.amount))}</strong><span>${esc(t.symbol?t.title:t.description||'')}${quantity}</span></span></button>`;
 }
 function ordersPage() {
   const r=recordRange();
   const rows=filterTrades(state.data,r,{query:state.search,asset:state.asset,currency:state.currency,side:state.side});
-  return `<section class="panel records-panel">${panelHead('历史成交',info('orders'))}${recordFilters()}<div class="toolbar">${segment('side',[['all','全部'],['Buy','买入'],['Sell','卖出']],state.side)}<span class="muted">${rows.length} 笔成交</span></div><div class="table-wrap"><table class="orders-table"><thead><tr><th>名称 / 代码</th><th>数量 / 成交价</th><th>方向</th><th>成交时间</th></tr></thead><tbody>${rows.slice(0,state.limit).map(t=>{const meta=instrumentFor(state.data,t.symbol,t.assetCategory),index=state.data.tradeDetails.indexOf(t);return `<tr data-trade="${index}" tabindex="0" role="button" aria-label="查看 ${esc(t.symbol)} ${t.side==='Buy'?'买入':'卖出'}成交详情"><td><strong class="holding-name">${esc(meta.name||t.symbol)}</strong><span class="symbol-line">${esc(t.symbol)} <small>${esc(category(t.assetCategory))}</small></span></td><td>${number(Math.abs(t.quantity),Number.isInteger(t.quantity)?0:4)}<span class="subvalue">${number(t.price,3)} ${esc(t.currency)}</span></td><td class="${t.side==='Buy'?'positive':'negative'}">${t.side==='Buy'?'买入':'卖出'}<span class="subvalue muted">成交记录</span></td><td>${dateText(t.date)}<span class="subvalue">${esc(tradeClock(t))}</span></td></tr>`;}).join('')}</tbody></table></div>${!rows.length?empty('没有匹配的成交记录','调整搜索或筛选条件后再试。'):more(rows.length)}<p class="footnote">时间保留报表原始记录。这里只查询实际成交，不包含未成交委托、撤单或状态历史。</p></section>`;
+  return `<section class="panel records-panel">${panelHead('历史成交',info('orders'))}${recordFilters()}<div class="toolbar">${segment('side',[['all','全部'],['Buy','买入'],['Sell','卖出']],state.side)}<span class="muted">${rows.length} 笔成交</span></div><div class="table-wrap"><table class="orders-table"><thead><tr><th>代码 / 名称</th><th>数量 / 成交价</th><th>方向</th><th>成交时间</th></tr></thead><tbody>${rows.slice(0,state.limit).map(t=>{const meta=instrumentFor(state.data,t.symbol,t.assetCategory),index=state.data.tradeDetails.indexOf(t);return `<tr data-trade="${index}" tabindex="0" role="button" aria-label="查看 ${esc(t.symbol)} ${t.side==='Buy'?'买入':'卖出'}成交详情"><td>${securityLabel(t.symbol,t.assetCategory,{name:meta.name})}</td><td>${number(Math.abs(t.quantity),Number.isInteger(t.quantity)?0:4)}<span class="subvalue">${number(t.price,3)} ${esc(t.currency)}</span></td><td class="${t.side==='Buy'?'positive':'negative'}">${t.side==='Buy'?'买入':'卖出'}<span class="subvalue muted">成交记录</span></td><td>${dateText(t.date)}<span class="subvalue">${esc(tradeClock(t))}</span></td></tr>`;}).join('')}</tbody></table></div>${!rows.length?empty('没有匹配的成交记录','调整搜索或筛选条件后再试。'):more(rows.length)}<p class="footnote">时间保留报表原始记录。这里只查询实际成交，不包含未成交委托、撤单或状态历史。</p></section>`;
 }
 function tradeClock(t) {return t.dateTimeText?.match(/\d{1,2}:\d{2}(?::\d{2})?/)?.[0] || '时间未提供';}
 function modal() {
@@ -256,15 +268,15 @@ function modal() {
   if(m.kind==='trade') {
     const t=state.data.tradeDetails[m.index];if(!t)return '';
     const meta=instrumentFor(state.data,t.symbol,t.assetCategory);heading='成交详情';
-    body=`<div class="detail-security"><h3>${esc(meta.name||t.symbol)}</h3><span class="muted">${esc(t.symbol)} · ${esc(category(t.assetCategory))}</span><strong class="${t.side==='Buy'?'positive':'negative'}">${t.side==='Buy'?'买入':'卖出'}</strong></div>${detailGrid([['成交时间',t.dateTimeText||t.date],['币种',t.currency],['成交数量',number(Math.abs(t.quantity),Number.isInteger(t.quantity)?0:4)],['成交价格',number(t.price,4)],['成交款项',signed(t.proceeds)+' '+t.currency],['手续费',signed(t.commission)+' '+t.commissionCurrency],['已实现盈亏',signed(t.realizedPL)+' '+t.currency],['报表交易代码',t.code||'—']])}<p class="footnote">成交款项与手续费分开展示；已实现盈亏沿用 IBKR 口径，不再重复扣费。</p>`;
+    body=`<div class="detail-security"><div class="security-identity">${securityLabel(t.symbol,t.assetCategory,{name:meta.name})}</div><strong class="${t.side==='Buy'?'positive':'negative'}">${t.side==='Buy'?'买入':'卖出'}</strong></div>${detailGrid([['成交时间',t.dateTimeText||t.date],['币种',t.currency],['成交数量',number(Math.abs(t.quantity),Number.isInteger(t.quantity)?0:4)],['成交价格',number(t.price,4)],['成交款项',signed(t.proceeds)+' '+t.currency],['手续费',signed(t.commission)+' '+t.commissionCurrency],['已实现盈亏',signed(t.realizedPL)+' '+t.currency],['报表交易代码',t.code||'—']])}<p class="footnote">成交款项与手续费分开展示；已实现盈亏沿用 IBKR 口径，不再重复扣费。</p>`;
   } else if(m.kind==='symbol') {
-    const meta=instrumentFor(state.data,m.symbol,m.assetCategory);heading=meta.name||m.symbol;
+    const meta=instrumentFor(state.data,m.symbol,m.assetCategory);heading=m.symbol;
     const trades=filterTrades(state.data,range(),{query:m.symbol}).filter(t=>t.symbol===m.symbol&&(!m.assetCategory||category(t.assetCategory)===category(m.assetCategory)));
-    const position=state.data.positions.find(p=>p.symbol===m.symbol&&p.assetCategory===m.assetCategory);
-    body=`<p class="muted">${esc(m.symbol)} ${meta.exchange?'· '+esc(meta.exchange):''}</p>${position?detailGrid([['持仓数量',number(position.quantity,Number.isInteger(position.quantity)?0:4)],['报表收盘价',number(position.closePrice,3)+' '+position.currency],['持仓市值',number(position.value)+' '+position.currency],['未实现盈亏',signed(position.unrealizedPL)+' '+position.currency]]):''}<h3>区间成交明细</h3><p class="muted">${dateText(range().start)} – ${dateText(range().end)}</p><div class="record-list">${trades.map(t=>`<button class="record-row" data-trade="${state.data.tradeDetails.indexOf(t)}"><span class="record-main"><strong class="${t.side==='Buy'?'positive':'negative'}">${t.side==='Buy'?'买入':'卖出'} ${number(Math.abs(t.quantity),Number.isInteger(t.quantity)?0:4)}</strong><span>${dateText(t.date)} ${esc(tradeClock(t))}</span></span><span class="record-right"><strong>${number(t.price,3)} ${esc(t.currency)}</strong><span>已实现 ${signed(t.realizedPL)}</span></span></button>`).join('')||empty('该期间没有成交记录')}</div>`;
+    const position=state.data.positions.find(p=>p.symbol===m.symbol&&(!m.assetCategory||category(p.assetCategory)===category(m.assetCategory)));
+    body=`<div class="detail-security"><span class="security-name">${meta.name!==m.symbol?esc(meta.name):''}</span>${securityTags(m.assetCategory||meta.assetCategory,position?.quantity<0)}${meta.exchange?`<span class="muted">${esc(meta.exchange)}</span>`:''}</div>${position?detailGrid([['持仓数量',number(position.quantity,Number.isInteger(position.quantity)?0:4)],['报表收盘价',number(position.closePrice,3)+' '+position.currency],['持仓市值',number(position.value)+' '+position.currency],['未实现盈亏',signed(position.unrealizedPL)+' '+position.currency]]):''}<h3>区间成交明细</h3><p class="muted">${dateText(range().start)} – ${dateText(range().end)}</p><div class="record-list">${trades.map(t=>`<button class="record-row" data-trade="${state.data.tradeDetails.indexOf(t)}"><span class="record-main"><strong class="${t.side==='Buy'?'positive':'negative'}">${t.side==='Buy'?'买入':'卖出'} ${number(Math.abs(t.quantity),Number.isInteger(t.quantity)?0:4)}</strong><span>${dateText(t.date)} ${esc(tradeClock(t))}</span></span><span class="record-right"><strong>${number(t.price,3)} ${esc(t.currency)}</strong><span>已实现 ${signed(t.realizedPL)}</span></span></button>`).join('')||empty('该期间没有成交记录')}</div>`;
   } else if(m.kind==='cash') {
     const t=cashRecords(state.data).find(t=>t.id===m.id);if(!t)return '';
-    heading=t.title;body=detailGrid([['日期',dateText(t.date)],['类型',t.title],['币种',t.currency],['金额',signed(t.amount)],['说明',t.description||'—']]);
+    heading=t.title;body=(t.symbol?`<div class="detail-security"><div class="security-identity">${securityLabel(t.symbol)}</div></div>`:'')+detailGrid([['日期',dateText(t.date)],['类型',t.title],['币种',t.currency],['金额',signed(t.amount)],['说明',t.description||'—']]);
   } else {
     heading='数据与计算说明';
     const notes={
@@ -291,7 +303,7 @@ function parseText(text,name,demo=false) {
     const data=parseIbkrReport(text);
     if(!Object.keys(data.sectionStats).length)throw new Error('未识别到报表区块，请导入 IBKR Activity Statement CSV/TXT。');
     state.data=data;state.sourceName=name;state.demo=demo;state.error='';state.page='analysis';
-    state.search='';state.range='year';state.chartMode='amount';state.calendarMonth=reportRange(data).end?.slice(0,7)||'';state.selectedDay='';state.modal=null;state.limit=40;
+    state.search='';state.range='year';state.chartMode='amount';state.chartDate=null;state.calendarMonth=reportRange(data).end?.slice(0,7)||'';state.selectedDay='';state.modal=null;state.limit=40;
     state.asset='all';state.side='all';state.currency='all';state.recordsPeriod='all';state.recordType='all';state.dateFrom='';state.dateTo='';state.showFilters=false;
   }catch(error){state.data=null;state.error=error.code==='missingExchangeRate'?`缺少 ${error.currency} 的本位币汇率。请导出包含汇率的报表后重新导入。`:error.code==='invalidCurrency'?'报表包含无效币种代码，请检查原始 CSV。':error.message||'报表解析失败，请检查文件格式。';}
   state.loading=false;render();

@@ -201,3 +201,35 @@ export function holdingTotals(data) {
   }
   return { value: sum('baseValue'), unrealized: sum('baseUnrealizedPL'), grossValue: sum('baseValue', true) };
 }
+
+export function holdingDistribution(data) {
+  const cash = data?.navDetails?.hasCash ? nullable(data?.nav?.cash) : null;
+  const positions = data?.positions || [];
+  const hasShort = cash < 0 || positions.some(row => row.baseValue < 0 || row.quantity < 0);
+  const totals = holdingTotals(data);
+  if (!finite(totals.grossValue)) return { items: [], total: null, cash, hasShort };
+
+  const sorted = [...positions].sort((left, right) =>
+    Math.abs(right.baseValue) - Math.abs(left.baseValue) || String(left.symbol || '').localeCompare(String(right.symbol || '')));
+  const items = sorted.slice(0, 5).map(row => {
+    const instrument = instrumentFor(data, row.symbol, row.assetCategory);
+    return {
+      kind: 'security', symbol: instrument.symbol, name: instrument.name,
+      assetCategory: instrument.assetCategory, value: row.baseValue, grossValue: Math.abs(row.baseValue)
+    };
+  });
+  if (sorted.length > 5) {
+    const rest = sorted.slice(5);
+    items.push({
+      kind: 'other', name: '其他',
+      value: rest.reduce((sum, row) => sum + row.baseValue, 0),
+      grossValue: rest.reduce((sum, row) => sum + Math.abs(row.baseValue), 0)
+    });
+  }
+  if (cash !== null) items.push({ kind: 'cash', name: '现金', value: cash, grossValue: Math.abs(cash) });
+  const total = totals.grossValue + Math.abs(cash ?? 0);
+  return {
+    items: items.map(item => ({ ...item, weight: total > 0 ? item.grossValue / total : 0 })),
+    total, cash, hasShort
+  };
+}

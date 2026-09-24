@@ -554,6 +554,7 @@ function parseNavChange(rows = []) {
 
 function parseNavDetails(sections) {
   const rows = sections["Net Asset Value"] || [];
+  const cashRow = rows.find((row) => row["Asset Class"] === "Cash");
   const totalRow = rows.find((row) => row["Asset Class"] === "Total");
   const changeMap = new Map((sections["Change in NAV"] || []).map((row) => [row["Field Name"], row["Field Value"]]));
   const changeKeys = NAV_CHANGE_FIELDS
@@ -561,6 +562,7 @@ function parseNavDetails(sections) {
     .map(([key]) => key);
   return {
     hasNav: toNullableNumber(readValue(totalRow, ["Current Total", "Total"])) !== null,
+    hasCash: toNullableNumber(readValue(cashRow, ["Current Total", "Total"])) !== null,
     hasReturn: rows.some((row) => toNullableNumber(row["Time Weighted Rate of Return"]) !== null),
     hasChange: changeKeys.length > 0,
     changeKeys

@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseIbkrReport } from '../src/parser.js';
-import { account, positionsHeader, stockRoundTrip, rates, forex } from './fixtures.js';
+import { account, positionsHeader, stockRoundTrip, rates, forex, completeReport } from './fixtures.js';
 import {
   reportRange, selectRange, filterTrades, instrumentFor, dailyRealized,
-  rankRealized, cashRecords, assetBridge, holdingTotals
+  rankRealized, cashRecords, assetBridge, holdingTotals, holdingDistribution
 } from '../src/dashboard-model.js';
 
 const trade = (date, overrides = {}) => ({
@@ -206,4 +206,70 @@ test('holdings totals distinguish omitted holdings sections from explicitly empt
   assert.deepEqual(holdingTotals({ positions: [], warnings: ['missingPositions'] }), unknown);
   assert.deepEqual(holdingTotals(parseIbkrReport(account + positionsHeader)), zero);
   assert.deepEqual(holdingTotals({ positions: [], sectionStats: { 'Open Positions': 0 } }), zero);
+});
+
+test('holdings distribution includes the report cash balance without deriving cash from NAV', () => {
+  const data = parseIbkrReport(completeReport);
+  data.nav.total = 5000; // Other NAV components cannot become inferred cash.
+  const distribution = holdingDistribution(data);
+  assert.equal(distribution.cash, 900);
+  assert.equal(distribution.total, 2000);
+  assert.equal(distribution.hasShort, false);
+  assert.deepEqual(distribution.items.map(item => [item.kind, item.value, item.weight]), [
+    ['security', 1100, 0.55], ['cash', 900, 0.45]
+  ]);
+});
+
+test('holdings distribution ranks the five largest absolute positions and keeps cash separate from others', () => {
+  const positions = Object.freeze([
+    { symbol: 'SMALL-LONG', baseValue: 10 }, { symbol: 'B', baseValue: 100 },
+    { symbol: 'C', baseValue: -90 }, { symbol: 'D', baseValue: 80 },
+    { symbol: 'E', baseValue: 70 }, { symbol: 'F', baseValue: 60 },
+    { symbol: 'SMALL-SHORT', baseValue: -10 }
+  ].map(row => Object.freeze({ ...row, assetCategory: 'Stocks' })));
+  const data = {
+    positions, navDetails: { hasCash: true }, nav: { cash: -80 },
+    instruments: [{ symbol: 'B', name: '证券 B', assetCategory: 'Stocks' }]
+  };
+  const distribution = holdingDistribution(data);
+  assert.deepEqual(distribution.items.slice(0, 5).map(row => row.symbol), ['B', 'C', 'D', 'E', 'F']);
+  assert.equal(distribution.items[0].name, '证券 B');
+  assert.equal(distribution.items[0].assetCategory, 'Stocks');
+  assert.equal(distribution.items[1].value, -90);
+  assert.equal(distribution.total, 500);
+  assert.equal(distribution.hasShort, true);
+  assert.deepEqual(distribution.items[5], { kind: 'other', name: '其他', value: 0, grossValue: 20, weight: 0.04 });
+  assert.deepEqual(distribution.items[6], { kind: 'cash', name: '现金', value: -80, grossValue: 80, weight: 0.16 });
+  assert.ok(Math.abs(distribution.items.reduce((sum, row) => sum + row.weight, 0) - 1) < 1e-12);
+  assert.equal(positions[0].symbol, 'SMALL-LONG');
+});
+
+test('unknown cash stays unknown while explicit zero and cash-only holdings remain valid', () => {
+  const data = { positions: [{ symbol: 'ABC', assetCategory: 'Stocks', baseValue: 100 }], nav: { cash: 999, total: 2000 } };
+  const unknown = holdingDistribution(data);
+  assert.equal(unknown.cash, null);
+  assert.equal(unknown.total, 100);
+  assert.equal(unknown.items.length, 1);
+  assert.equal(unknown.items[0].weight, 1);
+  const zero = holdingDistribution({ positions: [], navDetails: { hasCash: true }, nav: { cash: 0 } });
+  assert.equal(zero.cash, 0);
+  assert.equal(zero.total, 0);
+  assert.equal(zero.items[0].weight, 0);
+  const cashOnly = holdingDistribution(parseIbkrReport(account + positionsHeader +
+    'Net Asset Value,Header,Asset Class,Current Total\nNet Asset Value,Data,Cash,125\n'));
+  assert.equal(cashOnly.total, 125);
+  assert.deepEqual(cashOnly.items, [{ kind: 'cash', name: '现金', value: 125, grossValue: 125, weight: 1 }]);
+});
+
+test('missing holdings or incomplete valuations suppress distribution without losing known cash', () => {
+  for (const data of [
+    { positions: [], sectionStats: {} },
+    { positions: [], warnings: ['missingPositions'] },
+    { positions: [{ symbol: 'ABC', baseValue: null }] },
+    { positions: [{ symbol: 'ABC', baseValue: Infinity }] }
+  ]) {
+    assert.deepEqual(holdingDistribution({ ...data, navDetails: { hasCash: true }, nav: { cash: -50 } }), {
+      items: [], total: null, cash: -50, hasShort: true
+    });
+  }
 });
