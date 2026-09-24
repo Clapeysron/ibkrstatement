@@ -6,3 +6,34 @@ outputs/
 stitch-reference/chrome-lang-profile/
 .DS_Store
 Thumbs.db
+
+# Local statements and exported account data; only bundled demos are public
+*.csv
+*.tsv
+*.txt
+*.xls
+*.xlsx
+!/robots.txt
+!/samples/ibkr-sample-9999.csv
+!/samples/ibkr-sample-demo.csv
+/exports/
+/downloads/
+/screenshots/
+/tmp/
+/temp/
+
+# Local credentials, browser/test caches and editor state
+.env
+.env.*
+!.env.example
+.cache/
+.playwright/
+playwright-report/
+test-results/
+coverage/
+.codex/
+.idea/
+.vscode/
+*.db
+*.sqlite
+*.sqlite3

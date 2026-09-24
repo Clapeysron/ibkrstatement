@@ -21,6 +21,11 @@ const SECTION_ALIASES = new Map([
   ["股息", "Dividends"],
   ["利息", "Interest"],
   ["费用", "Fees"],
+  ["存款和取款", "Deposits & Withdrawals"],
+  ["代扣税", "Withholding Tax"],
+  ["代扣税款", "Withholding Tax"],
+  ["金融产品信息", "Financial Instrument Information"],
+  ["净股票持仓总结", "Net Stock Position Summary"],
   ["外汇盈亏明细", "Forex P/L Details"],
   ["外汇损益明细", "Forex P/L Details"],
   ["基础货币汇率", "Base Currency Exchange Rate"],
@@ -48,6 +53,8 @@ const HEADER_ALIASES = new Map([
   ["货币", "Currency"],
   ["日期", "Date"],
   ["日期/时间", "Date/Time"],
+  ["结算日期", "Settle Date"],
+  ["上市交易所", "Listing Exch"],
   ["描述", "Description"],
   ["金额", "Amount"],
   ["数量", "Quantity"],
@@ -90,6 +97,7 @@ const FIELD_NAME_ALIASES = new Map([
   ["代扣税款", "Withholding Tax"],
   ["利息", "Interest"],
   ["应计利息的变化", "Change in Interest Accruals"],
+  ["应计利息变更", "Change in Interest Accruals"],
   ["应计股息的变化", "Change in Dividend Accruals"],
   ["其它费用", "Other Fees"],
   ["其他费用", "Other Fees"],
@@ -97,6 +105,7 @@ const FIELD_NAME_ALIASES = new Map([
   ["销售税", "Sales Tax"],
   ["其它外汇折算", "Other FX Translations"],
   ["其他外汇折算", "Other FX Translations"],
+  ["其它外汇换算", "Other FX Translations"],
   ["结束价值", "Ending Value"],
   ["期末价值", "Ending Value"]
 ]);
@@ -171,6 +180,9 @@ export function parseIbkrReport(csvText) {
   const tickerPL = analyzeTickerPL(closedPositions);
   const nav = parseNetAssetValue(sections["Net Asset Value"], accountInfo.baseCurrency);
   const navChange = parseNavChange(sections["Change in NAV"]);
+  const navDetails = parseNavDetails(sections);
+  const instruments = parseInstruments(sections);
+  const cashTransactions = parseCashTransactions(sections, exchangeRates);
   const assetAllocation = summarizePositions(positions, "assetCategory");
   const currencyExposure = summarizePositions(positions, "currency");
   const warnings = buildWarnings(sections, nav, positions, tradeSummary);
@@ -181,6 +193,9 @@ export function parseIbkrReport(csvText) {
     exchangeRates,
     nav,
     navChange,
+    navDetails,
+    instruments,
+    cashTransactions,
     plSummary,
     dividendIncome,
     positions,
@@ -367,13 +382,104 @@ function parseAccountInfo(sections) {
   const statementMap = new Map(
     statementRows.map((row) => [row["Field Name"], row["Field Value"]])
   );
+  const period = statementMap.get("Period") || infoMap.get("Period") || "";
 
   return {
     account: infoMap.get("Account") || "",
     name: infoMap.get("Name") || "",
     baseCurrency: currencyCode(infoMap.get("Base Currency")),
-    period: statementMap.get("Period") || infoMap.get("Period") || ""
+    period,
+    reportGeneratedAt: statementMap.get("WhenGenerated") || "",
+    ...parseReportPeriod(period)
   };
+}
+
+function parseReportPeriod(period) {
+  const text = String(period || "").trim();
+  const empty = { periodStart: null, periodEnd: null };
+  if (!text) return empty;
+  // A month-only label does not establish the actual first/last report day.
+  const dates = text.split(/\s+(?:-|–|—|to|至)\s+/i).map((part) => {
+    const iso = part.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    const chinese = part.match(/^(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日$/);
+    if (iso || chinese) {
+      const match = iso || chinese;
+      const date = buildLocalDate(match[1], match[2], match[3]);
+      return date ? dateKey(date) : null;
+    }
+    const named = part.match(/^([A-Za-z.]+|[一二三四五六七八九十]+月)\s+(\d{1,2}),?\s+(\d{4})$/);
+    if (!named) return null;
+    const englishMonths = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    const chineseMonths = ["一月", "二月", "三月", "四月", "五月", "六月", "七月", "八月", "九月", "十月", "十一月", "十二月"];
+    const month = named[1].endsWith("月")
+      ? chineseMonths.indexOf(named[1]) + 1
+      : englishMonths.indexOf(named[1].slice(0, 3).toLowerCase()) + 1;
+    if (!month) return null;
+    const date = buildLocalDate(named[3], month, named[2]);
+    return date ? dateKey(date) : null;
+  });
+  if (dates.length < 1 || dates.length > 2 || dates.some((date) => date === null)) return empty;
+  const periodStart = dates[0];
+  const periodEnd = dates.at(-1);
+  return periodStart <= periodEnd ? { periodStart, periodEnd } : empty;
+}
+
+function parseInstruments(sections) {
+  const instruments = new Map();
+  // The instrument section is authoritative; position descriptions fill gaps.
+  for (const row of [
+    ...(sections["Financial Instrument Information"] || []),
+    ...(sections["Net Stock Position Summary"] || [])
+  ]) {
+    const symbol = row.Symbol;
+    const category = row["Asset Category"] || "";
+    if (!symbol || category.startsWith("Total")) continue;
+    const assetCategory = category === OPTION_ASSET ? "Options" : category;
+    const key = `${assetCategory}:${symbol}`;
+    const existing = instruments.get(key);
+    instruments.set(key, {
+      symbol,
+      name: existing?.name || row.Description || "",
+      assetCategory,
+      exchange: existing?.exchange || row["Listing Exch"] || "",
+      multiplier: existing?.multiplier ?? toNullableNumber(readValue(row, ["Multiplier", "Mult"]))
+    });
+  }
+  return Array.from(instruments.values());
+}
+
+function parseCashTransactions(sections, exchangeRates) {
+  const transactions = [];
+  const sources = [
+    ["Deposits & Withdrawals", "deposit"],
+    ["Fees", "fee"],
+    ["Interest", "interest"],
+    ["Dividends", "dividend"],
+    ["Withholding Tax", "withholdingTax"]
+  ];
+  for (const [section, type] of sources) {
+    for (const row of sections[section] || []) {
+      const rawDate = readValue(row, ["Date/Time", "Date", "Settle Date"]);
+      const date = parseDate(rawDate);
+      const amount = toNullableNumber(row.Amount);
+      const currency = String(row.Currency || "").trim().toUpperCase();
+      // Summary labels (including translated totals) are not currencies.
+      if (!date || amount === null || !/^[A-Z]{3}$/.test(currency)) continue;
+      const rate = exchangeRates[currency];
+      transactions.push({
+        date: dateKey(date),
+        ...(/\d{1,2}:\d{2}/.test(rawDate) ? { dateTime: date.toISOString() } : {}),
+        type: type === "deposit" && amount < 0 ? "withdrawal" : type,
+        description: row.Description || "",
+        currency,
+        amount,
+        // New optional cash sections must not break otherwise valid imports.
+        // Null makes an unavailable conversion distinct from a real zero.
+        baseAmount: Number.isFinite(rate) && rate > 0 ? amount * rate : null
+      });
+    }
+  }
+  return transactions.sort((a, b) => (a.dateTime || a.date).localeCompare(b.dateTime || b.date));
 }
 
 function parseExchangeRates(sections, baseCurrency) {
@@ -420,9 +526,7 @@ function parseNetAssetValue(rows = [], baseCurrency) {
   };
 }
 
-function parseNavChange(rows = []) {
-  const map = new Map(rows.map((row) => [row["Field Name"], row["Field Value"]]));
-  const fields = [
+const NAV_CHANGE_FIELDS = [
     ["startingValue", "期初净值", ["Starting Value"]],
     ["markToMarket", "盯市变化", ["Mark-to-Market"]],
     ["depositsAndWithdrawals", "出入金", ["Deposits & Withdrawals"]],
@@ -437,13 +541,30 @@ function parseNavChange(rows = []) {
     ["salesTax", "销售税", ["Sales Tax"]],
     ["otherFXTranslations", "汇兑折算", ["Other FX Translations"]],
     ["endingValue", "期末净值", ["Ending Value"]]
-  ];
+];
 
-  return fields.map(([key, label, sources]) => ({
+function parseNavChange(rows = []) {
+  const map = new Map(rows.map((row) => [row["Field Name"], row["Field Value"]]));
+  return NAV_CHANGE_FIELDS.map(([key, label, sources]) => ({
     key,
     label,
     value: toNumber(sources.map((source) => map.get(source)).find((value) => value !== undefined))
   }));
+}
+
+function parseNavDetails(sections) {
+  const rows = sections["Net Asset Value"] || [];
+  const totalRow = rows.find((row) => row["Asset Class"] === "Total");
+  const changeMap = new Map((sections["Change in NAV"] || []).map((row) => [row["Field Name"], row["Field Value"]]));
+  const changeKeys = NAV_CHANGE_FIELDS
+    .filter(([, , sources]) => sources.some((source) => toNullableNumber(changeMap.get(source)) !== null))
+    .map(([key]) => key);
+  return {
+    hasNav: toNullableNumber(readValue(totalRow, ["Current Total", "Total"])) !== null,
+    hasReturn: rows.some((row) => toNullableNumber(row["Time Weighted Rate of Return"]) !== null),
+    hasChange: changeKeys.length > 0,
+    changeKeys
+  };
 }
 
 function parsePlSummary(rows = [], trades = []) {
@@ -554,6 +675,7 @@ function parseOpenPositions(rows = [], exchangeRates) {
         side: quantity < 0 ? "Short" : "Long",
         multiplier: toNumber(row.Mult),
         costBasis,
+        costPrice: toNullableNumber(row["Cost Price"]),
         closePrice: toNumber(row["Close Price"]),
         value,
         dividends: 0,
@@ -696,6 +818,7 @@ function parseTradeDetails(rows = [], exchangeRates) {
       return {
         date: date ? dateKey(date) : "",
         dateTime: date ? date.toISOString() : "",
+        dateTimeText: row["Date/Time"] || "",
         month: date ? monthKey(date) : "",
         symbol: row.Symbol || "",
         baseSymbol: parseOptionSymbol(row.Symbol || "").baseSymbol || row.Symbol || "",
@@ -997,6 +1120,17 @@ function toNumber(value) {
   const number = Number.parseFloat(cleaned);
   if (Number.isNaN(number)) return 0;
   return negative ? -number : number;
+}
+
+function toNullableNumber(value) {
+  if (value === undefined || value === null) return null;
+  const raw = String(value).trim();
+  if (!raw || raw === "--") return null;
+  const cleaned = raw.replace(/[,$%\s()]/g, "");
+  if (!cleaned) return null;
+  const number = Number(cleaned);
+  if (!Number.isFinite(number)) return null;
+  return raw.startsWith("(") && raw.endsWith(")") ? -number : number;
 }
 
 function parseDate(value) {
